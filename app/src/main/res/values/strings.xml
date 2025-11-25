@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">F150 Monitor</string>
+    <string name="notification_channel_name">OBD Monitoring</string>
+    <string name="notification_channel_description">Foreground service for continuous OBD monitoring</string>
+</resources>
