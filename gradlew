@@ -1,0 +1,6 @@
+#!/bin/sh
+DIRNAME=$(dirname "$0")
+cd "$DIRNAME" || exit 1
+JAVACMD=${JAVA_HOME:+$JAVA_HOME/bin/}java
+CLASSPATH=$DIRNAME/gradle/wrapper/gradle-wrapper.jar
+exec "$JAVACMD" -classpath "$CLASSPATH" org.gradle.wrapper.GradleWrapperMain "$@"
