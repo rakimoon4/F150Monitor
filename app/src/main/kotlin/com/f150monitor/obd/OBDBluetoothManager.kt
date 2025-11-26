@@ -14,6 +14,8 @@ import java.util.UUID
 class OBDBluetoothManager {
     
     private val TAG = "OBDBluetoothManager"
+    
+    // Standard SPP UUID for OBD adapters
     private val SPP_UUID = UUID.fromString("00001101-0000-1000-8000-00805F9B34FB")
     
     private var bluetoothSocket: BluetoothSocket? = null
@@ -23,36 +25,91 @@ class OBDBluetoothManager {
     var isConnected = false
         private set
     
-    private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
-    
     @SuppressLint("MissingPermission")
     suspend fun connect(deviceAddress: String): Boolean = withContext(Dispatchers.IO) {
         try {
-            val bluetoothAdapter = BluetoothAdapter.getDefaultAdapter()
-            val device: BluetoothDevice = bluetoothAdapter.getRemoteDevice(deviceAddress)
+            Log.d(TAG, "Attempting to connect to: $deviceAddress")
             
-            Log.d(TAG, "Attempting to connect to: ${device.name} - $deviceAddress")
+            // Get the Bluetooth adapter
+            val bluetoothAdapter = BluetoothAdapter.getDefaultAdapter()
+            if (bluetoothAdapter == null) {
+                Log.e(TAG, "Bluetooth not supported on this device")
+                return@withContext false
+            }
             
             // Cancel discovery to speed up connection
-            bluetoothAdapter.cancelDiscovery()
+            try {
+                bluetoothAdapter.cancelDiscovery()
+            } catch (e: Exception) {
+                Log.w(TAG, "Could not cancel discovery: ${e.message}")
+            }
             
-            bluetoothSocket = device.createRfcommSocketToServiceRecord(SPP_UUID)
-            bluetoothSocket?.connect()
+            // Get the remote device
+            val device: BluetoothDevice = try {
+                bluetoothAdapter.getRemoteDevice(deviceAddress)
+            } catch (e: Exception) {
+                Log.e(TAG, "Invalid device address: ${e.message}")
+                return@withContext false
+            }
             
+            Log.d(TAG, "Got remote device: ${device.name}")
+            
+            // Close any existing connection
+            disconnect()
+            
+            // Create socket and connect
+            bluetoothSocket = try {
+                Log.d(TAG, "Creating RFCOMM socket...")
+                device.createRfcommSocketToServiceRecord(SPP_UUID)
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to create socket: ${e.message}")
+                return@withContext false
+            }
+            
+            try {
+                Log.d(TAG, "Connecting socket...")
+                bluetoothSocket?.connect()
+                Log.d(TAG, "Socket connected!")
+            } catch (e: IOException) {
+                Log.e(TAG, "Connection failed: ${e.message}")
+                // Try fallback method
+                try {
+                    Log.d(TAG, "Trying fallback connection method...")
+                    bluetoothSocket?.close()
+                    val method = device.javaClass.getMethod("createRfcommSocket", Int::class.javaPrimitiveType)
+                    bluetoothSocket = method.invoke(device, 1) as BluetoothSocket
+                    bluetoothSocket?.connect()
+                    Log.d(TAG, "Fallback connection successful!")
+                } catch (e2: Exception) {
+                    Log.e(TAG, "Fallback also failed: ${e2.message}")
+                    disconnect()
+                    return@withContext false
+                }
+            }
+            
+            // Get streams
             inputStream = bluetoothSocket?.inputStream
             outputStream = bluetoothSocket?.outputStream
             
+            if (inputStream == null || outputStream == null) {
+                Log.e(TAG, "Failed to get streams")
+                disconnect()
+                return@withContext false
+            }
+            
             // Initialize ELM327
+            Log.d(TAG, "Initializing ELM327...")
             if (initialize()) {
                 isConnected = true
                 Log.d(TAG, "Successfully connected and initialized OBD adapter")
                 true
             } else {
+                Log.e(TAG, "ELM327 initialization failed")
                 disconnect()
                 false
             }
-        } catch (e: IOException) {
-            Log.e(TAG, "Connection failed: ${e.message}")
+        } catch (e: Exception) {
+            Log.e(TAG, "Connection error: ${e.message}", e)
             disconnect()
             false
         }
@@ -60,86 +117,98 @@ class OBDBluetoothManager {
     
     private suspend fun initialize(): Boolean = withContext(Dispatchers.IO) {
         try {
-            // Reset adapter
-            sendCommand(OBDCommands.RESET)
-            delay(1500) // Wait for reset
-            
-            // Clear input buffer
-            inputStream?.available()?.let { available ->
-                val buffer = ByteArray(available)
-                inputStream?.read(buffer)
-            }
-            
-            // Configure adapter
-            sendCommand(OBDCommands.ECHO_OFF)
-            delay(200)
-            sendCommand(OBDCommands.LINE_FEED_OFF)
-            delay(200)
-            sendCommand(OBDCommands.HEADERS_OFF)
-            delay(200)
-            sendCommand(OBDCommands.SPACES_OFF)
-            delay(200)
-            sendCommand(OBDCommands.AUTO_PROTOCOL)
             delay(500)
             
-            // Test with a simple command
-            val response = sendCommand(OBDCommands.READ_VOLTAGE)
-            response.isNotEmpty() && !response.contains("ERROR")
+            // Reset adapter
+            var response = sendCommand("ATZ")
+            Log.d(TAG, "ATZ response: $response")
+            delay(1000)
+            
+            // Echo off
+            response = sendCommand("ATE0")
+            Log.d(TAG, "ATE0 response: $response")
+            delay(200)
+            
+            // Line feed off
+            response = sendCommand("ATL0")
+            Log.d(TAG, "ATL0 response: $response")
+            delay(200)
+            
+            // Spaces off
+            response = sendCommand("ATS0")
+            Log.d(TAG, "ATS0 response: $response")
+            delay(200)
+            
+            // Headers off
+            response = sendCommand("ATH0")
+            Log.d(TAG, "ATH0 response: $response")
+            delay(200)
+            
+            // Auto protocol
+            response = sendCommand("ATSP0")
+            Log.d(TAG, "ATSP0 response: $response")
+            delay(500)
+            
+            // Test with voltage read
+            response = sendCommand("ATRV")
+            Log.d(TAG, "ATRV response: $response")
+            
+            val success = response.isNotEmpty() && !response.contains("ERROR") && !response.contains("?")
+            Log.d(TAG, "Initialization ${if (success) "successful" else "failed"}")
+            success
         } catch (e: Exception) {
-            Log.e(TAG, "Initialization failed: ${e.message}")
+            Log.e(TAG, "Initialization error: ${e.message}")
             false
         }
     }
     
     suspend fun sendCommand(command: String): String = withContext(Dispatchers.IO) {
-        if (!isConnected) return@withContext ""
+        if (outputStream == null || inputStream == null) {
+            Log.w(TAG, "Streams not available")
+            return@withContext ""
+        }
         
         try {
             // Clear input buffer
-            inputStream?.available()?.let { available ->
-                if (available > 0) {
-                    val buffer = ByteArray(available)
-                    inputStream?.read(buffer)
-                }
+            while (inputStream?.available() ?: 0 > 0) {
+                inputStream?.read()
             }
             
             // Send command
-            val cmdBytes = "$command\r".toByteArray()
+            val cmdBytes = "$command\r".toByteArray(Charsets.US_ASCII)
             outputStream?.write(cmdBytes)
             outputStream?.flush()
             
             // Read response
-            delay(100) // Give time for response
+            delay(100)
             
             val response = StringBuilder()
             val buffer = ByteArray(1024)
             var attempts = 0
             
-            while (attempts < 20) { // Max 2 seconds
+            while (attempts < 30) {
                 val available = inputStream?.available() ?: 0
                 if (available > 0) {
-                    val bytesRead = inputStream?.read(buffer, 0, available) ?: 0
-                    response.append(String(buffer, 0, bytesRead))
-                    
-                    // Check if response is complete
-                    if (response.contains(">")) {
-                        break
+                    val bytesRead = inputStream?.read(buffer, 0, minOf(available, buffer.size)) ?: 0
+                    if (bytesRead > 0) {
+                        response.append(String(buffer, 0, bytesRead, Charsets.US_ASCII))
+                        if (response.contains(">")) {
+                            break
+                        }
                     }
                 }
                 delay(100)
                 attempts++
             }
             
-            // Clean up response
             response.toString()
                 .replace(command, "")
                 .replace("\r", "")
-                .replace("\n", "")
+                .replace("\n", " ")
                 .replace(">", "")
                 .trim()
-                
-        } catch (e: IOException) {
-            Log.e(TAG, "Error sending command: ${e.message}")
+        } catch (e: Exception) {
+            Log.e(TAG, "Error sending command '$command': ${e.message}")
             ""
         }
     }
@@ -148,28 +217,27 @@ class OBDBluetoothManager {
         val rawResponse = sendCommand(pid)
         
         if (rawResponse.isEmpty() || rawResponse.contains("ERROR") || 
-            rawResponse.contains("NO DATA") || rawResponse.contains("UNABLE")) {
-            return@withContext OBDResponse(pid, "", false, null)
+            rawResponse.contains("NO DATA") || rawResponse.contains("UNABLE") ||
+            rawResponse.contains("?")) {
+            return@withContext OBDResponse(pid, rawResponse, false, null)
         }
         
         try {
-            // Parse response - format is typically "41 0C XX XX" for PID 010C
-            val parts = rawResponse.split(" ")
-            if (parts.size >= 2) {
-                // Extract data bytes (skip mode and PID echo)
-                val dataBytes = parts.drop(2).joinToString("")
-                
-                // Get PID info and calculate value
-                val pidInfo = OBDCommands.monitoringPIDs[pid]
-                val value = pidInfo?.formula?.invoke(dataBytes)
-                
-                return@withContext OBDResponse(pid, dataBytes, true, value)
+            val cleaned = rawResponse.replace(" ", "")
+            if (cleaned.length >= 4) {
+                val dataStart = 4
+                if (cleaned.length > dataStart) {
+                    val dataBytes = cleaned.substring(dataStart)
+                    val pidInfo = OBDCommands.monitoringPIDs[pid]
+                    val value = pidInfo?.formula?.invoke(dataBytes)
+                    return@withContext OBDResponse(pid, dataBytes, true, value)
+                }
             }
         } catch (e: Exception) {
             Log.e(TAG, "Error parsing PID response: ${e.message}")
         }
         
-        return@withContext OBDResponse(pid, rawResponse, false, null)
+        OBDResponse(pid, rawResponse, false, null)
     }
     
     fun disconnect() {
@@ -178,6 +246,9 @@ class OBDBluetoothManager {
             inputStream?.close()
             outputStream?.close()
             bluetoothSocket?.close()
+            inputStream = null
+            outputStream = null
+            bluetoothSocket = null
             Log.d(TAG, "Disconnected from OBD adapter")
         } catch (e: IOException) {
             Log.e(TAG, "Error disconnecting: ${e.message}")
@@ -186,7 +257,6 @@ class OBDBluetoothManager {
     
     fun cleanup() {
         disconnect()
-        scope.cancel()
     }
     
     data class OBDResponse(
